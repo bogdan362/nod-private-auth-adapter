@@ -1,0 +1,155 @@
+#!/usr/bin/python3 -I
+"""Private saved-CLI authentication adapter. Never accepts a credential in argv."""
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+BASE = 'https://api.nocaptchaai.com'
+MAX_BYTES = 1024 * 1024
+MAX_INPUT = 64 * 1024
+ENV_NAME = 'NOCAPTCHAAI_API_KEY'
+OPERATIONS = {'balance', 'create-task', 'task-result', 'solve'}
+CREDENTIAL_FIELDS = {'apikey', 'clientkey', 'authorization', 'xapikey'}
+
+
+class AdapterError(Exception):
+    pass
+
+
+def variants(key):
+    values = {
+        key,
+        urllib.parse.quote(key, safe=''),
+        urllib.parse.quote(key),  # Python's default slash-preserving quote.
+        urllib.parse.quote_plus(key),
+        urllib.parse.quote(key, safe=";/?:@&=+$,#-_.!~*'()"),  # JS encodeURI.
+        urllib.parse.quote(key, safe="-_.!~*'()"),  # JS encodeURIComponent.
+        urllib.parse.quote_plus(key, safe='*').replace('~', '%7E'),  # URLSearchParams.
+    }
+    values |= {re.sub(r'%[0-9A-F]{2}', lambda m: m[0].lower(), s) for s in values}
+    values |= {json.dumps(s, ensure_ascii=ascii_only)[1:-1]
+               for s in list(values) for ascii_only in (True, False)}
+    return sorted(values, key=len, reverse=True)
+
+
+def redact(value, key):
+    text = json.dumps(value, ensure_ascii=True, allow_nan=False)
+    for secret in variants(key):
+        # Percent escapes are case-insensitive individually, including mixed case.
+        expression = re.sub(
+            r'%[0-9A-Fa-f]{2}',
+            lambda m: '%' + ''.join('[' + c.lower() + c.upper() + ']' if c.isalpha() else c
+                                    for c in m[0][1:]),
+            re.escape(secret),
+        )
+        text = re.sub(expression, '[REDACTED]', text)
+    return text
+
+
+def validate_input(value):
+    if isinstance(value, dict):
+        for name, item in value.items():
+            if ''.join(c for c in name.lower() if c.isalnum()) in CREDENTIAL_FIELDS:
+                raise AdapterError('Credential fields are forbidden in task input.')
+            validate_input(item)
+    elif isinstance(value, list):
+        for item in value:
+            validate_input(item)
+
+
+def request_for(argv, key):
+    if not isinstance(key, str) or len(key) < 8 or len(key) > 4096 or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in key):
+        raise AdapterError('A valid private environment credential is required.')
+    if not argv or argv[0] not in OPERATIONS:
+        raise AdapterError('Choose balance, create-task, task-result or solve.')
+    op = argv[0]
+    if op == 'balance':
+        if len(argv) != 1:
+            raise AdapterError('Balance accepts no arguments.')
+        url = BASE + '/balance?' + urllib.parse.urlencode({'apiKey': key})
+        return urllib.request.Request(url, headers={'Accept': 'application/json'}, method='GET')
+    if len(argv) != 3 or argv[1] != '--json' or len(argv[2].encode()) > MAX_INPUT:
+        raise AdapterError('This operation requires --json and a bounded JSON object.')
+    try:
+        body = json.loads(argv[2], parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+    except (ValueError, RecursionError):
+        raise AdapterError('Task input must be valid JSON.') from None
+    if not isinstance(body, dict):
+        raise AdapterError('Task input must be an object.')
+    validate_input(body)
+    headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
+    if op == 'task-result':
+        if set(body) != {'taskId'} or not isinstance(body['taskId'], str) or not 1 <= len(body['taskId']) <= 1024:
+            raise AdapterError('Task result requires only a taskId string.')
+        path = '/getTaskResult'
+        body = {**body, 'clientKey': key}
+    else:
+        if not isinstance(body.get('type'), str) or not body['type'].strip():
+            raise AdapterError('Task input requires a type string.')
+        if op == 'create-task':
+            path = '/createTask'
+            body = {'task': body, 'clientKey': key}
+        else:
+            path = '/solve'
+            headers['apikey'] = key
+    return urllib.request.Request(BASE + path, data=json.dumps(body, allow_nan=False).encode(), headers=headers, method='POST')
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # The balance URL and solve header contain credentials. Never follow redirects.
+        raise AdapterError('Provider redirect refused.')
+
+
+def fetch(request):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    with opener.open(request, timeout=20) as response:
+        content = response.read(MAX_BYTES + 1)
+    if len(content) > MAX_BYTES:
+        raise AdapterError('Provider response too large.')
+    try:
+        value = json.loads(content, parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+    except (ValueError, UnicodeError, RecursionError):
+        raise AdapterError('Provider returned invalid JSON.') from None
+    if not isinstance(value, dict):
+        raise AdapterError('Provider returned an unexpected response.')
+    return value
+
+
+def main(argv=None, environment=None, transport=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    environment = os.environ if environment is None else environment
+    # Help/version do not load a credential or make network calls.
+    if argv == ['--help']:
+        print('nocaptcha-private balance | (create-task|task-result|solve) --json JSON_OBJECT')
+        return 0
+    if argv == ['--version']:
+        print('nocaptcha-private 0.1.0-candidate')
+        return 0
+    key = environment.get(ENV_NAME, '')
+    try:
+        request = request_for(argv, key)
+        value = (fetch if transport is None else transport)(request)
+        result = redact(value, key)
+        # API-level failures must not appear to Nod as successful CLI calls.
+        failed = bool(value.get('errorId')) or value.get('status') == 'failed' or bool(value.get('error'))
+        print(result)
+        return 1 if failed else 0
+    except AdapterError as error:
+        # These messages are static and never include provider bodies, URLs or argv.
+        print(json.dumps({'error': str(error)}))
+    except urllib.error.HTTPError as error:
+        print(json.dumps({'error': 'Provider HTTP failure.', 'status': error.code}))
+    except Exception:
+        # Includes JSON failures, network exceptions and malformed credential types.
+        # A provider/urllib exception can contain the credentialed balance URL.
+        print(json.dumps({'error': 'Provider request failed; details withheld.'}))
+    return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
