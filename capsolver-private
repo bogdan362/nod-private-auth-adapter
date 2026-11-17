@@ -4,6 +4,7 @@ Sends ONLY page URL, sitekey and captcha parameters to CapSolver (field allow-li
 Commands:
   balance
   kinds                            (prints the supported kinds)
+  ledger-check                     (free, local: per-booking ledger writable + persistent?)
   solve --json JSON   e.g. {"kind":"recaptcha_v2_enterprise","websiteURL":"https://...","websiteKey":"..."}
         required: "bookingId" (local only, never sent; one id per booking = the caller's task id):
                   max 2 solves and $0.01 per booking id
@@ -29,8 +30,20 @@ KINDS = {
 BASE_FIELDS = {'kind', 'websiteURL', 'websiteKey', 'timeoutSeconds', 'maxCostUsd', 'bookingId'}
 MAX_SOLVES_PER_BOOKING = 2
 MAX_COST_PER_BOOKING = 0.01
-LEDGER = os.path.join(os.environ.get('XDG_STATE_HOME') or os.path.join(os.path.expanduser('~'), '.local', 'state'),
-                      'capsolver-private-ledger.json')
+
+
+def ledger_path():
+    """Per-booking ledger location. Nod gives every CLI call a fresh temporary HOME, so inside a Nod install
+    (<prefix>/bin/capsolver-private with <prefix>/.installed) the ledger lives in the persistent, private
+    install prefix. Otherwise XDG_STATE_HOME or ~/.local/state."""
+    prefix = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    if os.path.isfile(os.path.join(prefix, '.installed')):
+        return os.path.join(prefix, 'state', 'capsolver-private-ledger.json')
+    return os.path.join(os.environ.get('XDG_STATE_HOME') or os.path.join(os.path.expanduser('~'), '.local', 'state'),
+                        'capsolver-private-ledger.json')
+
+
+LEDGER = ledger_path()
 SAFE_VALUE = re.compile(r'^[A-Za-z0-9_\-.:/]*\Z')
 B64URL = re.compile(r'^[A-Za-z0-9_\-]{1,4096}={0,2}\Z')
 BOOKING_ID = re.compile(r'[A-Za-z0-9_\-]{1,64}')
@@ -161,6 +174,31 @@ def reserve_solve(booking, price):
         os.close(lock)
 
 
+def ledger_check():
+    """Free, local only (no provider call): proves the ledger is writable and persists between calls."""
+    try:
+        os.makedirs(os.path.dirname(LEDGER), mode=0o700, exist_ok=True)
+        lock = os.open(LEDGER + '.lock', os.O_WRONLY | os.O_CREAT, 0o600)
+    except OSError:
+        raise AdapterError('Ledger state dir not writable.') from None
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        ledger = load_ledger()
+        meta = ledger.get('_check') if isinstance(ledger.get('_check'), dict) else {}
+        previous = meta.get('at')
+        ledger['_check'] = {'solves': MAX_SOLVES_PER_BOOKING, 'cost': MAX_COST_PER_BOOKING, 'at': int(time.time()),
+                            'count': int(meta.get('count', 0)) + 1}
+        try:
+            save_ledger(ledger)
+        except OSError:
+            raise AdapterError('Ledger state dir not writable.') from None
+    finally:
+        os.close(lock)
+    return {'ok': True, 'ledgerWritable': True, 'inInstallPrefix': os.path.isfile(os.path.join(os.path.dirname(os.path.dirname(LEDGER)), '.installed')),
+            'previousCheckAt': previous, 'checks': ledger['_check']['count'],
+            'bookingsTracked': len([k for k in ledger if k != '_check'])}
+
+
 def provider_error(v):
     code = str(v.get('errorCode') or 'ERROR')[:80]
     desc = str(v.get('errorDescription') or '')[:200]
@@ -168,10 +206,14 @@ def provider_error(v):
 
 
 def run(argv, env, transport=post, sleep=time.sleep, clock=time.monotonic):
-    if not argv or argv[0] not in {'balance', 'solve', 'kinds'}:
-        raise AdapterError('Choose balance, solve or kinds.')
+    if not argv or argv[0] not in {'balance', 'solve', 'kinds', 'ledger-check'}:
+        raise AdapterError('Choose balance, solve, kinds or ledger-check.')
     if argv[0] == 'kinds':
         return {'ok': True, 'kinds': {k: v[0] for k, v in KINDS.items()}}
+    if argv[0] == 'ledger-check':
+        if len(argv) != 1:
+            raise AdapterError('ledger-check takes no arguments.')
+        return ledger_check()
     key = env.get(ENV_NAME, '')
     if not (isinstance(key, str) and 8 <= len(key) <= 512 and not any(c.isspace() for c in key)):
         raise AdapterError('CAPSOLVER_API_KEY missing in the environment.')
@@ -226,7 +268,7 @@ def main(argv=None, env=None, transport=post, sleep=time.sleep):
         print(__doc__.strip())
         return 0
     if argv == ['--version']:
-        print('capsolver-private 0.2.0')
+        print('capsolver-private 0.3.0')
         return 0
     try:
         out, code = run(argv, env, transport, sleep), 0
