@@ -1,0 +1,244 @@
+#!/usr/bin/python3 -I
+"""CapSolver private adapter (stdlib only). Key only from env CAPSOLVER_API_KEY, never argv.
+Sends ONLY page URL, sitekey and captcha parameters to CapSolver (field allow-list; no lead data).
+Commands:
+  balance
+  kinds                            (prints the supported kinds)
+  solve --json JSON   e.g. {"kind":"recaptcha_v2_enterprise","websiteURL":"https://...","websiteKey":"..."}
+        required: "bookingId" (local only, never sent; one id per booking = the caller's task id):
+                  max 2 solves and $0.01 per booking id
+        optional: "timeoutSeconds" (10-120, default 90), "maxCostUsd" (per call, default 0.01, max 0.05)
+Output: one JSON object; the API key is always redacted. On success "token" holds the solved token
+(needed for injection; callers must never log it).
+Exit 0 = ok; 1 = failure (clean message in "error").
+"""
+import fcntl, json, os, re, sys, time, urllib.error, urllib.parse, urllib.request
+
+BASE = 'https://api.capsolver.com'
+ENV_NAME = 'CAPSOLVER_API_KEY'
+MAX_BYTES = 1024 * 1024
+# kind -> (CapSolver task type, allowed optional fields, list price USD per solve; docs.capsolver.com/en/pricing, 17 Nov 2026)
+KINDS = {
+    'recaptcha_v2':            ('ReCaptchaV2TaskProxyLess', {'isInvisible', 'pageAction', 'apiDomain'}, 0.0008),
+    'recaptcha_v2_invisible':  ('ReCaptchaV2TaskProxyLess', {'isInvisible', 'pageAction', 'apiDomain'}, 0.0008),
+    'recaptcha_v2_enterprise': ('ReCaptchaV2EnterpriseTaskProxyLess', {'isInvisible', 'pageAction', 'apiDomain', 'enterprisePayload'}, 0.0010),
+    'recaptcha_v3':            ('ReCaptchaV3TaskProxyLess', {'pageAction', 'apiDomain'}, 0.0010),
+    'recaptcha_v3_enterprise': ('ReCaptchaV3EnterpriseTaskProxyLess', {'pageAction', 'apiDomain', 'enterprisePayload'}, 0.0030),
+    'turnstile':               ('AntiTurnstileTaskProxyLess', {'metadata'}, 0.0012),
+}
+BASE_FIELDS = {'kind', 'websiteURL', 'websiteKey', 'timeoutSeconds', 'maxCostUsd', 'bookingId'}
+MAX_SOLVES_PER_BOOKING = 2
+MAX_COST_PER_BOOKING = 0.01
+LEDGER = os.path.join(os.environ.get('XDG_STATE_HOME') or os.path.join(os.path.expanduser('~'), '.local', 'state'),
+                      'capsolver-private-ledger.json')
+SAFE_VALUE = re.compile(r'^[A-Za-z0-9_\-.:/]*\Z')
+B64URL = re.compile(r'^[A-Za-z0-9_\-]{1,4096}={0,2}\Z')
+BOOKING_ID = re.compile(r'[A-Za-z0-9_\-]{1,64}')
+
+
+class AdapterError(Exception):
+    pass
+
+
+def redact_text(text, secrets):
+    for s in sorted({x for x in secrets if isinstance(x, str) and len(x) >= 8}, key=len, reverse=True):
+        for v in {s, urllib.parse.quote(s, safe=''), urllib.parse.quote_plus(s), json.dumps(s)[1:-1]}:
+            text = re.sub(re.escape(v), '[REDACTED]', text, flags=re.I)
+    return re.sub(r'CAP-[A-Za-z0-9]{16,}', '[REDACTED]', text)
+
+
+def validate(body):
+    if not isinstance(body, dict):
+        raise AdapterError('Input must be a JSON object.')
+    kind = body.get('kind')
+    if kind not in KINDS:
+        raise AdapterError('Unsupported kind. Use: ' + ', '.join(sorted(KINDS)))
+    ttype, optional, price = KINDS[kind]
+    extra = set(body) - BASE_FIELDS - optional
+    if extra:
+        raise AdapterError('Field(s) not allowed (no lead data may be sent): ' + ', '.join(sorted(extra)))
+    url = body.get('websiteURL', '')
+    p = urllib.parse.urlsplit(url) if isinstance(url, str) else None
+    if not p or p.scheme != 'https' or not p.netloc or len(url) > 2048:
+        raise AdapterError('websiteURL must be an https URL.')
+    if p.query or p.fragment or '@' in url or re.search(r'%40', url, re.I):
+        raise AdapterError('websiteURL must have no query string, fragment, userinfo or email (strip them first).')
+    key = body.get('websiteKey', '')
+    if not isinstance(key, str) or not re.fullmatch(r'[A-Za-z0-9_\-]{10,100}', key):
+        raise AdapterError('websiteKey must be a sitekey string.')
+    task = {'type': ttype, 'websiteURL': url, 'websiteKey': key}
+    for f in sorted(optional & set(body)):
+        v = body[f]
+        if f == 'isInvisible':
+            if not isinstance(v, bool):
+                raise AdapterError('isInvisible must be true/false.')
+        elif f == 'enterprisePayload':
+            if not (isinstance(v, dict) and set(v) <= {'s'} and all(isinstance(x, str) and B64URL.match(x) for x in v.values())):
+                raise AdapterError('enterprisePayload may only contain "s" (base64url characters only).')
+        elif f == 'metadata':
+            if not (isinstance(v, dict) and set(v) <= {'action', 'cdata'}
+                    and all(isinstance(x, str) and SAFE_VALUE.match(x) and len(x) < 256 for x in v.values())):
+                raise AdapterError('metadata may only contain action/cdata.')
+        elif not (isinstance(v, str) and SAFE_VALUE.match(v) and len(v) <= 256):
+            raise AdapterError(f'{f} has an invalid value.')
+        task[f] = v
+    if kind == 'recaptcha_v2_invisible':
+        task['isInvisible'] = True
+    timeout = body.get('timeoutSeconds', 90)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 10 <= timeout <= 120:
+        raise AdapterError('timeoutSeconds must be 10-120.')
+    cap = body.get('maxCostUsd', 0.01)
+    if isinstance(cap, bool) or not isinstance(cap, (int, float)) or cap <= 0 or cap > 0.05:
+        raise AdapterError('maxCostUsd must be >0 and <=0.05.')
+    if price > cap:
+        raise AdapterError(f'Cost ceiling: {kind} costs ~${price} per solve, above maxCostUsd ${cap}.')
+    return task, float(timeout), price
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        raise AdapterError('Provider redirect refused.')
+
+
+def post(path, body, timeout=20):
+    req = urllib.request.Request(BASE + path, data=json.dumps(body).encode(),
+                                 headers={'Content-Type': 'application/json', 'Accept': 'application/json'},
+                                 method='POST')
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    with opener.open(req, timeout=timeout) as r:
+        content = r.read(MAX_BYTES + 1)
+    if len(content) > MAX_BYTES:
+        raise AdapterError('Provider response too large.')
+    v = json.loads(content)
+    if not isinstance(v, dict):
+        raise AdapterError('Provider returned an unexpected response.')
+    return v
+
+
+def load_ledger():
+    try:
+        with open(LEDGER) as fh:
+            v = json.load(fh)
+        return v if isinstance(v, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_ledger(ledger):
+    cutoff = time.time() - 7 * 86400
+    ledger = {k: v for k, v in ledger.items() if isinstance(v, dict) and v.get('at', 0) >= cutoff}
+    os.makedirs(os.path.dirname(LEDGER), mode=0o700, exist_ok=True)
+    tmp = LEDGER + '.tmp'
+    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), 'w') as fh:
+        json.dump(ledger, fh)
+    os.replace(tmp, LEDGER)
+
+
+def reserve_solve(booking, price):
+    """Count this solve in the per-booking ledger BEFORE createTask (failed attempts count too). Locked."""
+    try:
+        os.makedirs(os.path.dirname(LEDGER), mode=0o700, exist_ok=True)
+        lock = os.open(LEDGER + '.lock', os.O_WRONLY | os.O_CREAT, 0o600)
+    except OSError:
+        raise AdapterError('Cannot record the per-booking limit (state dir not writable); not solving.') from None
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        ledger = load_ledger()
+        used = ledger.get(booking)
+        if not (isinstance(used, dict) and isinstance(used.get('solves'), int)
+                and isinstance(used.get('cost'), (int, float))):
+            used = {'solves': 0, 'cost': 0.0}
+        if used['solves'] >= MAX_SOLVES_PER_BOOKING:
+            raise AdapterError(f'Limit reached: {MAX_SOLVES_PER_BOOKING} solves already used for this booking. Stop and report.')
+        if used['cost'] + price > MAX_COST_PER_BOOKING + 1e-9:
+            raise AdapterError(f'Cost ceiling ${MAX_COST_PER_BOOKING} per booking reached. Stop and report.')
+        ledger[booking] = {'solves': used['solves'] + 1, 'cost': round(used['cost'] + price, 6), 'at': int(time.time())}
+        try:
+            save_ledger(ledger)
+        except OSError:
+            raise AdapterError('Cannot record the per-booking limit (state dir not writable); not solving.') from None
+    finally:
+        os.close(lock)
+
+
+def provider_error(v):
+    code = str(v.get('errorCode') or 'ERROR')[:80]
+    desc = str(v.get('errorDescription') or '')[:200]
+    return f'CapSolver error {code}: {desc}'.strip()
+
+
+def run(argv, env, transport=post, sleep=time.sleep, clock=time.monotonic):
+    if not argv or argv[0] not in {'balance', 'solve', 'kinds'}:
+        raise AdapterError('Choose balance, solve or kinds.')
+    if argv[0] == 'kinds':
+        return {'ok': True, 'kinds': {k: v[0] for k, v in KINDS.items()}}
+    key = env.get(ENV_NAME, '')
+    if not (isinstance(key, str) and 8 <= len(key) <= 512 and not any(c.isspace() for c in key)):
+        raise AdapterError('CAPSOLVER_API_KEY missing in the environment.')
+    if argv[0] == 'balance':
+        if len(argv) != 1:
+            raise AdapterError('balance takes no arguments.')
+        v = transport('/getBalance', {'clientKey': key})
+        if v.get('errorId'):
+            raise AdapterError(provider_error(v))
+        return {'ok': True, 'balanceUsd': v.get('balance')}
+    if len(argv) != 3 or argv[1] != '--json' or len(argv[2]) > 16384:
+        raise AdapterError('solve requires --json JSON_OBJECT.')
+    try:
+        body = json.loads(argv[2])
+    except ValueError:
+        raise AdapterError('Input must be valid JSON.') from None
+    task, timeout, price = validate(body)
+    booking = body.get('bookingId')
+    if booking is None or booking == '':
+        raise AdapterError('bookingId is required (use your task id, one per booking).')
+    if not (isinstance(booking, str) and BOOKING_ID.fullmatch(booking)):
+        raise AdapterError('bookingId must be a short id (letters, digits, - or _).')
+    reserve_solve(booking, price)
+    start = clock()
+    v = transport('/createTask', {'clientKey': key, 'task': task})
+    if v.get('errorId'):
+        raise AdapterError(provider_error(v))
+    tid = v.get('taskId')
+    sol = (v.get('solution') or {}) if v.get('status') == 'ready' else None
+    while sol is None:
+        if not tid:
+            raise AdapterError('Provider returned no taskId.')
+        if clock() - start > timeout:
+            raise AdapterError(f'Timed out after {int(timeout)}s.')
+        sleep(2.5)
+        v = transport('/getTaskResult', {'clientKey': key, 'taskId': tid})
+        if v.get('errorId'):
+            raise AdapterError(provider_error(v))
+        if v.get('status') == 'ready':
+            sol = v.get('solution') or {}
+    token = sol.get('gRecaptchaResponse') or sol.get('token')
+    if not isinstance(token, str) or len(token) < 20:
+        raise AdapterError('Provider returned no token.')
+    return {'ok': True, 'kind': body['kind'], 'token': token, 'userAgent': sol.get('userAgent'),
+            'seconds': round(clock() - start, 1), 'estCostUsd': price}
+
+
+def main(argv=None, env=None, transport=post, sleep=time.sleep):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    env = os.environ if env is None else env
+    if argv in (['--help'], []):
+        print(__doc__.strip())
+        return 0
+    if argv == ['--version']:
+        print('capsolver-private 0.2.0')
+        return 0
+    try:
+        out, code = run(argv, env, transport, sleep), 0
+    except AdapterError as e:
+        out, code = {'ok': False, 'error': str(e)}, 1
+    except urllib.error.HTTPError as e:
+        out, code = {'ok': False, 'error': f'Provider HTTP failure {e.code}.'}, 1
+    except Exception:
+        out, code = {'ok': False, 'error': 'Provider request failed; details withheld.'}, 1
+    print(redact_text(json.dumps(out), [env.get(ENV_NAME, '')]))
+    return code
+
+
+if __name__ == '__main__':
+    sys.exit(main())
